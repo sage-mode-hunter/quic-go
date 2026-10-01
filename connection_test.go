@@ -3225,29 +3225,47 @@ func TestConnectionEarlyClose(t *testing.T) {
 }
 
 func TestConnectionPathValidation(t *testing.T) {
-	t.Run("NAT rebinding", func(t *testing.T) {
-		testConnectionPathValidation(t, true)
-	})
-
-	t.Run("intentional migration", func(t *testing.T) {
-		testConnectionPathValidation(t, false)
-	})
+	for _, test := range []struct {
+		name       string
+		disableMTU bool
+		df         bool
+	}{
+		{name: "MTU discovery disabled", disableMTU: true, df: true},
+		{name: "DF unsupported"},
+		{name: "MTU discovery enabled", df: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Run("NAT rebinding", func(t *testing.T) {
+				testConnectionPathValidation(t, true, test.disableMTU, test.df)
+			})
+			t.Run("intentional migration", func(t *testing.T) {
+				testConnectionPathValidation(t, false, test.disableMTU, test.df)
+			})
+		})
+	}
 }
 
-func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
+func testConnectionPathValidation(t *testing.T, isNATRebinding, disableMTU, df bool) {
 	synctest.Test(t, func(t *testing.T) {
-		mockCtrl := gomock.NewController(t)
+		mockCtrl := gomock.NewController(t, gomock.WithOverridableExpectations())
 		unpacker := NewMockUnpacker(mockCtrl)
 		tc := newServerTestConnection(
 			t,
 			mockCtrl,
-			nil,
+			&Config{DisablePathMTUDiscovery: disableMTU, InitialPacketSize: 1234},
 			false,
 			connectionOptUnpacker(unpacker),
 			connectionOptHandshakeConfirmed(),
 			connectionOptRTT(time.Second),
 		)
+		tc.sendConn.EXPECT().capabilities().Return(connCapabilities{DF: df}).AnyTimes()
 		require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1456}))
+		if !disableMTU && df {
+			tc.conn.mtuDiscoverer.Start(monotime.Now())
+			ping, size := tc.conn.mtuDiscoverer.GetPing(monotime.Now())
+			ping.Handler.OnAcked(ping.Frame)
+			require.Greater(t, size, protocol.ByteCount(1234))
+		}
 
 		newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
 		require.NotEqual(t, tc.remoteAddr, newRemoteAddr)
@@ -3371,6 +3389,9 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 		default:
 			t.Fatal("should have migrated")
 		}
+		assert.Equal(t, protocol.ByteCount(1234), tc.conn.mtuDiscoverer.CurrentSize())
+		assert.False(t, tc.conn.mtuDiscoverer.ShouldSendProbe(monotime.Now()))
+		assert.Equal(t, !disableMTU && df, tc.conn.mtuDiscoverer.ShouldSendProbe(monotime.Now().Add(time.Hour)))
 
 		// test teardown
 		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
@@ -3391,6 +3412,53 @@ func TestConnectionMigrationServer(t *testing.T) {
 	tc := newServerTestConnection(t, nil, nil, false)
 	_, err := tc.conn.AddPath(&Transport{})
 	require.ErrorContains(t, err, "server cannot initiate connection migration")
+}
+
+func TestConnectionMigrationMTUDiscovery(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		disableMTU   bool
+		oldDF, newDF bool
+	}{
+		{name: "MTU discovery disabled", disableMTU: true, oldDF: true, newDF: true},
+		{name: "DF unsupported on new path", oldDF: true},
+		{name: "DF supported on new path", newDF: true},
+		{name: "DF supported on both paths", oldDF: true, newDF: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t, gomock.WithOverridableExpectations())
+			sender := NewMockSender(mockCtrl)
+			tc := newClientTestConnection(t, mockCtrl,
+				&Config{DisablePathMTUDiscovery: test.disableMTU, InitialPacketSize: 1234},
+				false, connectionOptSender(sender),
+			)
+			tc.sendConn.EXPECT().capabilities().Return(connCapabilities{DF: test.oldDF}).AnyTimes()
+			require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+				InitialSourceConnectionID:       tc.destConnID,
+				OriginalDestinationConnectionID: tc.destConnID,
+				MaxUDPPayloadSize:               1456,
+			}))
+			tc.conn.applyTransportParameters()
+			now := monotime.Now()
+			if !test.disableMTU && test.oldDF {
+				tc.conn.mtuDiscoverer.Start(now)
+				ping, size := tc.conn.mtuDiscoverer.GetPing(now)
+				ping.Handler.OnAcked(ping.Frame)
+				require.Greater(t, size, protocol.ByteCount(1234))
+			}
+
+			conn := NewMockRawConn(mockCtrl)
+			conn.EXPECT().LocalAddr().Return(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4321})
+			conn.EXPECT().capabilities().Return(connCapabilities{DF: test.newDF}).AnyTimes()
+			sender.EXPECT().Close()
+			tc.conn.switchToNewPath(&Transport{conn: conn}, now)
+			defer tc.conn.sendQueue.Close()
+
+			require.Equal(t, protocol.ByteCount(1234), tc.conn.mtuDiscoverer.CurrentSize())
+			require.False(t, tc.conn.mtuDiscoverer.ShouldSendProbe(now))
+			require.Equal(t, !test.disableMTU && test.newDF, tc.conn.mtuDiscoverer.ShouldSendProbe(now.Add(time.Hour)))
+		})
+	}
 }
 
 func TestConnectionMigration(t *testing.T) {
